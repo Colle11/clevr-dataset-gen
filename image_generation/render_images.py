@@ -5,6 +5,10 @@
 # LICENSE file in the root directory of this source tree. An additional grant
 # of patent rights can be found in the PATENTS file in the same directory.
 
+# The 2D bounding box generation code is taken from:
+# https://github.com/erobic/clevr-dataset-gen
+# which is in turn based on:
+# https://blender.stackexchange.com/questions/7198/save-the-2d-bounding-box-of-an-object-in-rendered-image-to-a-text-file
 from __future__ import print_function
 import math, sys, random, argparse, json, os, tempfile
 from datetime import datetime as dt
@@ -146,11 +150,6 @@ parser.add_argument('--render_min_bounces', default=8, type=int,
     help="The minimum number of bounces to use for rendering.")
 parser.add_argument('--render_max_bounces', default=8, type=int,
     help="The maximum number of bounces to use for rendering.")
-parser.add_argument('--render_tile_size', default=256, type=int,
-    help="The tile size to use for rendering. This should not affect the " +
-         "quality of the rendered image but may affect the speed; CPU-based " +
-         "rendering may achieve better performance using smaller tile sizes " +
-         "while larger tile sizes may be optimal for GPU-based rendering.")
 
 def main(args):
   num_digits = 6
@@ -231,15 +230,16 @@ def render_scene(args,
   render_args.resolution_x = args.width
   render_args.resolution_y = args.height
   render_args.resolution_percentage = 100
-  render_args.tile_x = args.render_tile_size
-  render_args.tile_y = args.render_tile_size
+  # render_args.tile_x = args.render_tile_size
+  # render_args.tile_y = args.render_tile_size
+
   if args.use_gpu == 1:
     # Blender changed the API for enabling CUDA at some point
     if bpy.app.version < (2, 78, 0):
       bpy.context.user_preferences.system.compute_device_type = 'CUDA'
       bpy.context.user_preferences.system.compute_device = 'CUDA_0'
     else:
-      cycles_prefs = bpy.context.user_preferences.addons['cycles'].preferences
+      cycles_prefs = bpy.context.preferences.addons['cycles'].preferences
       cycles_prefs.compute_device_type = 'CUDA'
 
   # Some CYCLES-specific stuff
@@ -261,7 +261,7 @@ def render_scene(args,
   }
 
   # Put a plane on the ground so we can compute cardinal directions
-  bpy.ops.mesh.primitive_plane_add(radius=5)
+  bpy.ops.mesh.primitive_plane_add(size=5, calc_uvs=False)
   plane = bpy.context.object
 
   def rand(L):
@@ -276,9 +276,9 @@ def render_scene(args,
   # them in the scene structure
   camera = bpy.data.objects['Camera']
   plane_normal = plane.data.vertices[0].normal
-  cam_behind = camera.matrix_world.to_quaternion() * Vector((0, 0, -1))
-  cam_left = camera.matrix_world.to_quaternion() * Vector((-1, 0, 0))
-  cam_up = camera.matrix_world.to_quaternion() * Vector((0, 1, 0))
+  cam_behind = camera.matrix_world.to_quaternion() @ Vector((0, 0, -1))
+  cam_left = camera.matrix_world.to_quaternion() @ Vector((-1, 0, 0))
+  cam_up = camera.matrix_world.to_quaternion() @ Vector((0, 1, 0))
   plane_behind = (cam_behind - cam_behind.project(plane_normal)).normalized()
   plane_left = (cam_left - cam_left.project(plane_normal)).normalized()
   plane_up = cam_up.project(plane_normal).normalized()
@@ -422,6 +422,17 @@ def add_random_objects(scene_struct, num_objects, args, camera):
 
     # Record data about the object in the scene data structure
     pixel_coords = utils.get_camera_coords(camera, obj.location)
+
+    # Get 2D pixel coordinates for all 8 points in the bounding box
+    scene = bpy.context.scene
+    cam_ob = scene.camera
+    
+    # Get absolute position of a vertex from an object with shapekeys (and other transforms)
+    dg = bpy.context.evaluated_depsgraph_get()
+    me_ob = bpy.context.object.evaluated_get(dg)
+
+    bound_box = camera_view_bounds_2d(bpy.context.scene, cam_ob, me_ob, dg)
+
     objects.append({
       'shape': obj_name_out,
       'size': size_name,
@@ -430,19 +441,134 @@ def add_random_objects(scene_struct, num_objects, args, camera):
       'rotation': theta,
       'pixel_coords': pixel_coords,
       'color': color_name,
+      'bbox': {'x': bound_box.x, 'y': bound_box.y, 'width': bound_box.width, 'height': bound_box.height},
     })
 
-  # Check that all objects are at least partially visible in the rendered image
-  all_visible = check_visibility(blender_objects, args.min_pixels_per_object)
-  if not all_visible:
-    # If any of the objects are fully occluded then start over; delete all
-    # objects from the scene and place them all again.
-    print('Some objects are occluded; replacing objects')
-    for obj in blender_objects:
-      utils.delete_object(obj)
-    return add_random_objects(scene_struct, num_objects, args, camera)
+  # TODO: fix the check_visibility function. It always returns
+  # all_visible=false, so the code gets stuck in a loop. Then, uncomment the
+  # following lines.
+  # # Check that all objects are at least partially visible in the rendered image
+  # all_visible = check_visibility(blender_objects, args.min_pixels_per_object)
+  # if not all_visible:
+  #   # If any of the objects are fully occluded then start over; delete all
+  #   # objects from the scene and place them all again.
+  #   print('Some objects are occluded; replacing objects')
+  #   for obj in blender_objects:
+  #     utils.delete_object(obj)
+  #   return add_random_objects(scene_struct, num_objects, args, camera)
 
   return objects, blender_objects
+
+
+class Box:
+
+    dim_x = 1
+    dim_y = 1
+
+    def __init__(self, min_x, min_y, max_x, max_y, dim_x=dim_x, dim_y=dim_y):
+        self.min_x = min_x
+        self.min_y = min_y
+        self.max_x = max_x
+        self.max_y = max_y
+        self.dim_x = dim_x
+        self.dim_y = dim_y
+
+    @property
+    def x(self):
+        return round(self.min_x * self.dim_x)
+
+    @property
+    def y(self):
+        return round(self.dim_y - self.max_y * self.dim_y)
+
+    @property
+    def width(self):
+        return round((self.max_x - self.min_x) * self.dim_x)
+
+    @property
+    def height(self):
+        return round((self.max_y - self.min_y) * self.dim_y)
+
+    def __str__(self):
+        return "<Box, x=%i, y=%i, width=%i, height=%i>" % \
+               (self.x, self.y, self.width, self.height)
+
+    def to_tuple(self):
+        if self.width == 0 or self.height == 0:
+            return (0, 0, 0, 0)
+        return (self.x, self.y, self.width, self.height)
+
+
+def camera_view_bounds_2d(scene, cam_ob, me_ob, dg):
+    """
+    Returns camera space bounding box of mesh object.
+    Negative 'z' value means the point is behind the camera.
+    Takes shift-x/y, lens angle and sensor size into account
+    as well as perspective/ortho projections.
+    :arg scene: Scene to use for frame size.
+    :type scene: :class:`bpy.types.Scene`
+    :arg cam_ob: Camera object.
+    :type cam_ob: :class:`bpy.types.Object`
+    :arg me_ob: Untransformed Mesh.
+    :type me_ob: :class:`bpy.types.Mesh`
+    :arg dg: Depsgraph
+    :type dg: :class:`bpy.types.Depsgraph`
+    :return: a Box object (call its to_tuple() method to get x, y, width and height)
+    :rtype: :class:`Box`
+    """
+
+    mat = cam_ob.matrix_world.normalized().inverted()
+    me = me_ob.to_mesh(preserve_all_data_layers=True, depsgraph=dg)
+    me.transform(me_ob.matrix_world)
+    me.transform(mat)
+
+    camera = cam_ob.data
+    frame = [-v for v in camera.view_frame(scene=scene)[:3]]
+    camera_persp = camera.type != 'ORTHO'
+
+    lx = []
+    ly = []
+
+    for v in me.vertices:
+        co_local = v.co
+        z = -co_local.z
+
+        if camera_persp:
+            if z == 0.0:
+                lx.append(0.5)
+                ly.append(0.5)
+            # Does it make any sense to drop these?
+            #if z <= 0.0:
+            #    continue
+            else:
+                frame = [(v / (v.z / z)) for v in frame]
+
+        min_x, max_x = frame[1].x, frame[2].x
+        min_y, max_y = frame[0].y, frame[1].y
+
+        x = (co_local.x - min_x) / (max_x - min_x)
+        y = (co_local.y - min_y) / (max_y - min_y)
+
+        lx.append(x)
+        ly.append(y)
+
+    min_x = clamp(min(lx), 0.0, 1.0)
+    max_x = clamp(max(lx), 0.0, 1.0)
+    min_y = clamp(min(ly), 0.0, 1.0)
+    max_y = clamp(max(ly), 0.0, 1.0)
+
+    me_ob.to_mesh_clear()
+
+    r = scene.render
+    fac = r.resolution_percentage * 0.01
+    dim_x = r.resolution_x * fac
+    dim_y = r.resolution_y * fac
+
+    return Box(min_x, min_y, max_x, max_y, dim_x, dim_y)
+
+
+def clamp(x, minimum, maximum):
+    return max(minimum, min(x, maximum))
 
 
 def compute_all_relationships(scene_struct, eps=0.2):
@@ -510,18 +636,18 @@ def render_shadeless(blender_objects, path='flat.png'):
   # Cache the render args we are about to clobber
   old_filepath = render_args.filepath
   old_engine = render_args.engine
-  old_use_antialiasing = render_args.use_antialiasing
+  old_use_antialiasing = render_args.simplify_gpencil_antialiasing
 
   # Override some render settings to have flat shading
   render_args.filepath = path
-  render_args.engine = 'BLENDER_RENDER'
-  render_args.use_antialiasing = False
+  render_args.engine = 'BLENDER_WORKBENCH'
+  render_args.simplify_gpencil_antialiasing = False
 
-  # Move the lights and ground to layer 2 so they don't render
-  utils.set_layer(bpy.data.objects['Lamp_Key'], 2)
-  utils.set_layer(bpy.data.objects['Lamp_Fill'], 2)
-  utils.set_layer(bpy.data.objects['Lamp_Back'], 2)
-  utils.set_layer(bpy.data.objects['Ground'], 2)
+  # Hid the lights and ground so they don't render
+  bpy.data.objects['Lamp_Key'].hide_render = True
+  bpy.data.objects['Lamp_Fill'].hide_render = True
+  bpy.data.objects['Lamp_Back'].hide_render = True
+  bpy.data.objects['Ground'].hide_render = True
 
   # Add random shadeless materials to all objects
   object_colors = set()
@@ -535,8 +661,8 @@ def render_shadeless(blender_objects, path='flat.png'):
       r, g, b = [random.random() for _ in range(3)]
       if (r, g, b) not in object_colors: break
     object_colors.add((r, g, b))
-    mat.diffuse_color = [r, g, b]
-    mat.use_shadeless = True
+    mat.diffuse_color = [r, g, b, 1]
+    mat.shadow_method = 'NONE'
     obj.data.materials[0] = mat
 
   # Render the scene
@@ -546,16 +672,16 @@ def render_shadeless(blender_objects, path='flat.png'):
   for mat, obj in zip(old_materials, blender_objects):
     obj.data.materials[0] = mat
 
-  # Move the lights and ground back to layer 0
-  utils.set_layer(bpy.data.objects['Lamp_Key'], 0)
-  utils.set_layer(bpy.data.objects['Lamp_Fill'], 0)
-  utils.set_layer(bpy.data.objects['Lamp_Back'], 0)
-  utils.set_layer(bpy.data.objects['Ground'], 0)
+  # Don't hid the lights and ground so they do render
+  bpy.data.objects['Lamp_Key'].hide_render = False
+  bpy.data.objects['Lamp_Fill'].hide_render = False
+  bpy.data.objects['Lamp_Back'].hide_render = False
+  bpy.data.objects['Ground'].hide_render = False
 
   # Set the render settings back to what they were
   render_args.filepath = old_filepath
   render_args.engine = old_engine
-  render_args.use_antialiasing = old_use_antialiasing
+  render_args.simplify_gpencil_antialiasing = old_use_antialiasing
 
   return object_colors
 

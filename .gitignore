@@ -2,4 +2,16 @@
 __pycache__/
 *.swp
 *.pyc
+
+# Environments
+.envs/
+
+# Poetry
+pyproject.toml
+poetry.lock
+
+# Conda
+environment.yml
+
+# Images and scene files of the generated dataset
 output/
