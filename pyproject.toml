@@ -1,0 +1,14 @@
+[tool.poetry]
+name = "clevr-dataset-gen"
+version = "0.1.0"
+description = "Fork and rework of \"CLEVR Dataset Generation\"."
+authors = ["Michele Collevati <11272443+Colle11@users.noreply.github.com>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "~3.11"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
